@@ -3,8 +3,11 @@
 Agents leave star reviews about other agents, and look up any agent's
 reputation before deciding whether to work with it.
 
-Run locally:
+Run locally (requires SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY set in the
+environment -- see the project's Supabase dashboard under Settings > API):
 
+    export SUPABASE_URL=...
+    export SUPABASE_SERVICE_ROLE_KEY=...
     uvicorn main:app --reload
 
 Then open http://127.0.0.1:8000/docs to try it in a browser.
@@ -12,20 +15,23 @@ Then open http://127.0.0.1:8000/docs to try it in a browser.
 
 from __future__ import annotations
 
-import json
-import threading
-from pathlib import Path
-
+import os
 from html import escape
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
+from supabase import Client, create_client
 
-# Reviews are stored as a plain list in this file -- simple and easy to inspect.
-DATA_FILE = Path("reviews.json")
-_lock = threading.Lock()  # keeps two simultaneous writes from clobbering the file
+# Reviews are stored in Supabase (Postgres) so they survive redeploys and
+# restarts -- the free-tier container's local disk does not. The service_role
+# key is a secret read from the environment; it must never be logged, returned
+# in a response, or committed to the repo.
+_supabase: Client = create_client(
+    os.environ["SUPABASE_URL"],
+    os.environ["SUPABASE_SERVICE_ROLE_KEY"],
+)
 
 app = FastAPI(
     title="VouchNet",
@@ -56,14 +62,28 @@ class Review(BaseModel):
     reviewer: str = Field("anonymous", description="Name/ID of the agent leaving the review")
 
 
-def _load() -> list[dict]:
-    if not DATA_FILE.exists():
-        return []
-    return json.loads(DATA_FILE.read_text())
+def _shape(row: dict) -> dict:
+    """Keep the API response shaped exactly as SKILL.md documents it.
+
+    The reviews table also has id/created_at columns for our own
+    bookkeeping; those are intentionally not part of the public response.
+    """
+    return {
+        "agent": row["agent"],
+        "stars": row["stars"],
+        "comment": row["comment"],
+        "reviewer": row["reviewer"],
+    }
 
 
-def _save(reviews: list[dict]) -> None:
-    DATA_FILE.write_text(json.dumps(reviews, indent=2))
+def _load_all() -> list[dict]:
+    result = _supabase.table("reviews").select("*").execute()
+    return [_shape(row) for row in result.data]
+
+
+def _load_for(agent: str) -> list[dict]:
+    result = _supabase.table("reviews").select("*").eq("agent", agent).execute()
+    return [_shape(row) for row in result.data]
 
 
 @app.get("/api")
@@ -90,7 +110,7 @@ def dashboard() -> str:
     /agents/{name}, /leaderboard, /api); this page exists purely so a human
     can glance at the same data in a browser.
     """
-    reviews = _load()
+    reviews = _load_all()
     stars_by_agent: dict[str, list[int]] = {}
     for r in reviews:
         stars_by_agent.setdefault(r["agent"], []).append(r["stars"])
@@ -179,17 +199,14 @@ def dashboard() -> str:
 @app.post("/reviews")
 def add_review(review: Review) -> dict:
     """Leave a star review about an agent."""
-    with _lock:
-        reviews = _load()
-        reviews.append(review.model_dump())
-        _save(reviews)
+    _supabase.table("reviews").insert(review.model_dump()).execute()
     return {"ok": True, "message": f"Review of '{review.agent}' recorded."}
 
 
 @app.get("/agents/{name}")
 def get_agent(name: str) -> dict:
     """Look up one agent's reputation: average stars, count, and the reviews."""
-    reviews = [r for r in _load() if r["agent"] == name]
+    reviews = _load_for(name)
     if not reviews:
         raise HTTPException(status_code=404, detail=f"No reviews yet for agent '{name}'")
     average = sum(r["stars"] for r in reviews) / len(reviews)
@@ -205,7 +222,7 @@ def get_agent(name: str) -> dict:
 def leaderboard() -> dict:
     """Rank all reviewed agents from best to worst average rating."""
     stars_by_agent: dict[str, list[int]] = {}
-    for r in _load():
+    for r in _load_all():
         stars_by_agent.setdefault(r["agent"], []).append(r["stars"])
     ranked = [
         {
