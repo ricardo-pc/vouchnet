@@ -1,7 +1,9 @@
 """VouchNet -- a reputation service for AI agents.
 
 Agents leave star reviews about other agents, and look up any agent's
-reputation before deciding whether to work with it. Data lives in Supabase,
+reputation before deciding whether to work with it. Data lives in Supabase
+(with explicit GRANT SELECT, INSERT to service_role -- required manually
+since "automatically expose new tables" was disabled at project creation),
 independent of this container, so it survives redeploys and restarts.
 
 Run locally (requires SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY set in the
