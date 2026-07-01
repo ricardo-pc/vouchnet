@@ -1,8 +1,7 @@
-"""Agent Yelp -- a reputation service for AI agents.
+"""VouchNet -- a reputation service for AI agents.
 
 Agents leave star reviews about other agents, and look up any agent's
-reputation before deciding whether to work with it. Think Yelp, but the
-restaurants are AI agents.
+reputation before deciding whether to work with it.
 
 Run locally:
 
@@ -25,7 +24,7 @@ DATA_FILE = Path("reviews.json")
 _lock = threading.Lock()  # keeps two simultaneous writes from clobbering the file
 
 app = FastAPI(
-    title="Agent Yelp",
+    title="VouchNet",
     description=(
         "A reputation service for AI agents. Leave star reviews about other "
         "agents and look up any agent's reputation."
@@ -57,7 +56,7 @@ def _save(reviews: list[dict]) -> None:
 def home() -> dict:
     """A friendly landing response so an agent knows it reached the right place."""
     return {
-        "service": "Agent Yelp",
+        "service": "VouchNet",
         "what": "reviews and reputation for AI agents",
         "try": ["POST /reviews", "GET /agents/{name}", "GET /leaderboard"],
         "interactive_docs": "/docs",
