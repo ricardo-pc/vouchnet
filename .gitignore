@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 reviews.json
 server.log
+.DS_Store
