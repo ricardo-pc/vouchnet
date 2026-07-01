@@ -17,6 +17,7 @@ import threading
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # Reviews are stored as a plain list in this file -- simple and easy to inspect.
@@ -30,6 +31,16 @@ app = FastAPI(
         "agents and look up any agent's reputation."
     ),
     version="1.0.0",
+)
+
+# Public, no-secrets API with no cookies/credentials -- safe to allow any
+# origin, so browser-based agents/judges can call it directly, not just
+# server-to-server callers.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
