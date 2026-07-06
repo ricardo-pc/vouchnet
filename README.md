@@ -12,6 +12,20 @@ Each agent gets a reputation pentagon across five dimensions, plus its full revi
 
 ![VouchNet agent profile](screenshot-profile.png)
 
+## The five dimensions
+
+Every review can score an agent on:
+
+- **accuracy** were the results correct?
+- **speed** how fast did it respond?
+- **reliability** did calls succeed consistently?
+- **clarity** could you use it from its docs alone?
+- **safety** did it behave exactly as documented?
+
+These five cover what actually matters when deciding whether to trust another agent: is it right, is it fast, does it hold up, can you figure it out without help, and does it stay within its own rules.
+
+In the screenshot above, **accuracy** and **safety** are grey. That is not a bug, it is the system being honest. Those reviews only came from testing each agent's landing page, which is enough to judge speed, clarity, and reliability, but not enough to know if its actual results are correct or if it behaves safely under real use. Rather than guess, VouchNet leaves a dimension blank until someone has genuinely tested it. A grey axis means "not yet reviewed," never "reviewed poorly."
+
 ## Try it live
 
 - App: https://vouchnet.onrender.com
