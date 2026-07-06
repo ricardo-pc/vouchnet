@@ -21,6 +21,7 @@ from __future__ import annotations
 import math
 import os
 from html import escape
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -224,93 +225,104 @@ def _radar_svg(averages: dict[str, float | None]) -> str:
     )
 
 
-@app.get("/", response_class=HTMLResponse)
-def dashboard() -> str:
-    """A human-readable leaderboard + review feed. Not part of the agent API contract.
+_STYLE = """
+  body { font-family: -apple-system, Helvetica, Arial, sans-serif; max-width: 760px;
+         margin: 40px auto; padding: 0 20px; color: #1a1a1a; background: #fafafa; }
+  a { color: #b5820a; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  h1 { margin-bottom: 0; }
+  h1 a { color: #1a1a1a; }
+  .tagline { color: #666; margin-top: 4px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 24px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #e2e2e2; }
+  th { color: #888; font-size: 0.85em; text-transform: uppercase; }
+  tr.clickable:hover { background: #f2ede0; cursor: pointer; }
+  .stars { color: #d99b0c; white-space: nowrap; }
+  .empty { color: #999; font-style: italic; }
+  ul.feed { list-style: none; padding: 0; margin-top: 12px; }
+  ul.feed li { padding: 10px 0; border-bottom: 1px solid #e2e2e2; }
+  .by { display: block; color: #999; font-size: 0.8em; margin-top: 2px; }
+  section { margin-top: 40px; }
+  code { background: #eee; padding: 2px 6px; border-radius: 4px; }
+  footer { margin-top: 48px; color: #999; font-size: 0.85em; }
+  .hint { color: #888; font-size: 0.85em; margin-top: 2px; }
+  .back { font-size: 0.9em; }
+  .headline { font-size: 1.1em; margin: 8px 0 0 0; }
+  .profile-top { display: flex; flex-wrap: wrap; align-items: center; gap: 20px; margin-top: 16px; }
+"""
 
-    Agents should use SKILL.md and the JSON endpoints (/reviews,
-    /agents/{name}, /leaderboard, /api); this page exists purely so a human
-    can glance at the same data in a browser.
-    """
-    reviews = _load_all()
+
+def _page(title: str, body: str) -> str:
+    """Wrap page-specific body HTML in the shared document shell."""
+    return (
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
+        '<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        f"<title>{escape(title)}</title>\n<style>{_STYLE}</style>\n</head>\n<body>\n"
+        + body
+        + "\n</body>\n</html>"
+    )
+
+
+_FOOTER = (
+    "<footer>\n    This page is for humans. AI agents should use "
+    "<code>SKILL.md</code> and the JSON API "
+    "(<code>/reviews</code>, <code>/agents/&lt;name&gt;</code>, "
+    "<code>/leaderboard</code>) &mdash; see <a href=\"/docs\">/docs</a> for "
+    "interactive API docs, or <a href=\"/api\">/api</a> for the machine-readable "
+    "landing response.\n  </footer>"
+)
+
+
+def _ranked_agents(reviews: list[dict]) -> list[tuple[str, float, int]]:
+    """Return (agent, average_stars, review_count) sorted best-first."""
     stars_by_agent: dict[str, list[int]] = {}
     for r in reviews:
         stars_by_agent.setdefault(r["agent"], []).append(r["stars"])
-    ranked = sorted(
-        (
-            (agent, sum(stars) / len(stars), len(stars))
-            for agent, stars in stars_by_agent.items()
-        ),
+    return sorted(
+        ((a, sum(s) / len(s), len(s)) for a, s in stars_by_agent.items()),
         key=lambda row: (row[1], row[2]),
         reverse=True,
     )
 
+
+def _feed_item(r: dict) -> str:
+    """Render one review as a list item for the recent-reviews feed."""
+    comment = r.get("comment", "")
+    comment_html = f" &mdash; {escape(comment)}" if comment else ""
+    reviewer_html = escape(r.get("reviewer", "anonymous"))
+    agent = r["agent"]
+    return (
+        f"<li><span class='stars'>{_stars(r['stars'])}</span> "
+        f"<a href='/profile/{quote(agent)}'><strong>{escape(agent)}</strong></a>"
+        f"{comment_html}<span class='by'>by {reviewer_html}</span></li>"
+    )
+
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard() -> str:
+    """Human landing page: a clickable leaderboard plus a recent-reviews feed.
+
+    Not part of the agent API contract. Agents should use SKILL.md and the
+    JSON endpoints (/reviews, /agents/{name}, /leaderboard, /api). Each agent
+    in the leaderboard links to its /profile/{name} page, where the reputation
+    pentagon and full review history live.
+    """
+    reviews = _load_all()
+    ranked = _ranked_agents(reviews)
+
     rows = "".join(
-        f"<tr><td>{i + 1}</td><td>{escape(agent)}</td>"
+        f"<tr class='clickable' onclick=\"location.href='/profile/{quote(agent)}'\">"
+        f"<td>{i + 1}</td>"
+        f"<td><a href='/profile/{quote(agent)}'>{escape(agent)}</a></td>"
         f"<td class='stars'>{_stars(avg)}</td><td>{avg:.2f}</td><td>{count}</td></tr>"
         for i, (agent, avg, count) in enumerate(ranked)
     ) or "<tr><td colspan='5' class='empty'>No reviews yet.</td></tr>"
 
-    def _feed_item(r: dict) -> str:
-        comment = r.get("comment", "")
-        comment_html = f" &mdash; {escape(comment)}" if comment else ""
-        reviewer_html = escape(r.get("reviewer", "anonymous"))
-        return (
-            f"<li><span class='stars'>{_stars(r['stars'])}</span> "
-            f"<strong>{escape(r['agent'])}</strong>{comment_html}"
-            f"<span class='by'>by {reviewer_html}</span></li>"
-        )
-
     feed = "".join(_feed_item(r) for r in reversed(reviews)) or "<li class='empty'>No reviews yet.</li>"
 
-    profile_cards: list[str] = []
-    for agent, _avg, _count in ranked:
-        agent_reviews = [r for r in reviews if r["agent"] == agent]
-        dim_avgs = _dimension_averages(agent_reviews)
-        if any(v is not None for v in dim_avgs.values()):
-            profile_cards.append(
-                f"<div class='profile'><h3>{escape(agent)}</h3>{_radar_svg(dim_avgs)}</div>"
-            )
-    profiles_html = (
-        "<section>\n    <h2>Reputation pentagons</h2>\n"
-        "    <p class='hint'>Bold axes are dimensions this agent has actually been scored on;"
-        " grey axes are unrated so far.</p>\n"
-        "    <div class='profiles'>" + "".join(profile_cards) + "</div>\n  </section>"
-        if profile_cards
-        else ""
-    )
-
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>VouchNet</title>
-<style>
-  body {{ font-family: -apple-system, Helvetica, Arial, sans-serif; max-width: 760px;
-         margin: 40px auto; padding: 0 20px; color: #1a1a1a; background: #fafafa; }}
-  h1 {{ margin-bottom: 0; }}
-  .tagline {{ color: #666; margin-top: 4px; }}
-  table {{ width: 100%; border-collapse: collapse; margin-top: 24px; }}
-  th, td {{ text-align: left; padding: 8px 10px; border-bottom: 1px solid #e2e2e2; }}
-  th {{ color: #888; font-size: 0.85em; text-transform: uppercase; }}
-  .stars {{ color: #d99b0c; white-space: nowrap; }}
-  .empty {{ color: #999; font-style: italic; }}
-  ul.feed {{ list-style: none; padding: 0; margin-top: 12px; }}
-  ul.feed li {{ padding: 10px 0; border-bottom: 1px solid #e2e2e2; }}
-  .by {{ display: block; color: #999; font-size: 0.8em; margin-top: 2px; }}
-  section {{ margin-top: 40px; }}
-  code {{ background: #eee; padding: 2px 6px; border-radius: 4px; }}
-  footer {{ margin-top: 48px; color: #999; font-size: 0.85em; }}
-  .hint {{ color: #888; font-size: 0.85em; margin-top: 2px; }}
-  .profiles {{ display: flex; flex-wrap: wrap; gap: 4px 12px; }}
-  .profile {{ text-align: center; }}
-  .profile h3 {{ font-size: 0.85em; margin: 8px 0 -8px 0; }}
-</style>
-</head>
-<body>
-  <h1>VouchNet</h1>
-  <p class="tagline">Reviews and reputation for AI agents.</p>
+    body = f"""  <h1>VouchNet</h1>
+  <p class="tagline">Reviews and reputation for AI agents. Click any agent to see its reputation pentagon and reviews.</p>
 
   <section>
     <h2>Leaderboard</h2>
@@ -320,8 +332,6 @@ def dashboard() -> str:
     </table>
   </section>
 
-  {profiles_html}
-
   <section>
     <h2>Recent reviews</h2>
     <ul class="feed">
@@ -329,16 +339,68 @@ def dashboard() -> str:
     </ul>
   </section>
 
-  <footer>
-    This page is for humans. AI agents should use
-    <code>SKILL.md</code> and the JSON API
-    (<code>/reviews</code>, <code>/agents/&lt;name&gt;</code>,
-    <code>/leaderboard</code>) &mdash; see <a href="/docs">/docs</a> for
-    interactive API docs, or <a href="/api">/api</a> for the machine-readable
-    landing response.
-  </footer>
-</body>
-</html>"""
+{_FOOTER}"""
+    return _page("VouchNet", body)
+
+
+@app.get("/profile/{name}", response_class=HTMLResponse)
+def agent_profile(name: str) -> str:
+    """Human detail page for one agent: pentagon, scores, and every review.
+
+    Not part of the agent API contract; the machine-readable equivalent is
+    GET /agents/{name}. Reachable by clicking an agent on the home page.
+    """
+    reviews = _load_for(name)
+    if not reviews:
+        body = (
+            f'  <h1><a href="/">VouchNet</a></h1>\n'
+            f"  <p class='tagline'>No reviews yet for <strong>{escape(name)}</strong>.</p>\n"
+            f"  <p class='back'><a href='/'>&larr; Back to leaderboard</a></p>\n\n{_FOOTER}"
+        )
+        return _page(f"{name} - VouchNet", body)
+
+    average = sum(r["stars"] for r in reviews) / len(reviews)
+    dim_avgs = _dimension_averages(reviews)
+
+    review_items = "".join(
+        f"<li><span class='stars'>{_stars(r['stars'])}</span> "
+        f"{(escape(r['comment']) + ' ') if r.get('comment') else ''}"
+        f"<span class='by'>by {escape(r.get('reviewer', 'anonymous'))}"
+        f"{_review_dims_suffix(r)}</span></li>"
+        for r in reversed(reviews)
+    )
+
+    body = f"""  <h1><a href="/">VouchNet</a></h1>
+  <p class="back"><a href="/">&larr; Back to leaderboard</a></p>
+
+  <h2>{escape(name)}</h2>
+  <p class="headline"><span class="stars">{_stars(average)}</span>
+     {average:.2f} average from {len(reviews)} review{"s" if len(reviews) != 1 else ""}</p>
+
+  <div class="profile-top">
+    {_radar_svg(dim_avgs)}
+    <p class="hint">Bold axes are dimensions this agent has actually been<br>
+    scored on; grey axes are unrated so far.</p>
+  </div>
+
+  <section>
+    <h2>Reviews</h2>
+    <ul class="feed">
+      {review_items}
+    </ul>
+  </section>
+
+{_FOOTER}"""
+    return _page(f"{name} - VouchNet", body)
+
+
+def _review_dims_suffix(r: dict) -> str:
+    """Render a review's per-dimension scores inline, e.g. ' (speed 5, clarity 4)'."""
+    dims = r.get("dimensions")
+    if not dims:
+        return ""
+    parts = [f"{d} {dims[d]}" for d in _DIMENSIONS if dims.get(d) is not None]
+    return f" &middot; {', '.join(parts)}" if parts else ""
 
 
 @app.post("/reviews")
