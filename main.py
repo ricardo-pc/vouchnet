@@ -21,11 +21,12 @@ from __future__ import annotations
 import math
 import os
 from html import escape
+from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field, field_validator
 from supabase import Client, create_client
 
@@ -160,6 +161,16 @@ def api_info() -> dict:
         "try": ["POST /reviews", "GET /agents/{name}", "GET /leaderboard"],
         "interactive_docs": "/docs",
     }
+
+
+@app.get("/skill.md", response_class=PlainTextResponse)
+def skill_md() -> str:
+    """Serve SKILL.md directly so agents can fetch it from this same domain.
+
+    Read from disk on every request (not cached at import time) so a
+    redeploy always serves the current file without a code change.
+    """
+    return Path(__file__).parent.joinpath("SKILL.md").read_text()
 
 
 def _stars(average: float) -> str:
