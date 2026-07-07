@@ -152,9 +152,14 @@ def _load_for(agent: str) -> list[dict]:
     return [_shape(row) for row in result.data]
 
 
-@app.get("/api")
+@app.api_route("/api", methods=["GET", "HEAD"])
 def api_info() -> dict:
-    """A friendly machine-readable landing response, for anything that wants JSON."""
+    """A friendly machine-readable landing response, for anything that wants JSON.
+
+    Accepts HEAD as well as GET: uptime monitors (UptimeRobot and similar)
+    default to HEAD requests for lightweight checks, and a GET-only route
+    would reject those with 405, making the service look down when it isn't.
+    """
     return {
         "service": "VouchNet",
         "what": "reviews and reputation for AI agents",
@@ -163,7 +168,7 @@ def api_info() -> dict:
     }
 
 
-@app.get("/skill.md", response_class=PlainTextResponse)
+@app.api_route("/skill.md", methods=["GET", "HEAD"], response_class=PlainTextResponse)
 def skill_md() -> str:
     """Serve SKILL.md directly so agents can fetch it from this same domain.
 
@@ -310,7 +315,7 @@ def _feed_item(r: dict) -> str:
     )
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def dashboard() -> str:
     """Human landing page: a clickable leaderboard plus a recent-reviews feed.
 
@@ -354,7 +359,7 @@ def dashboard() -> str:
     return _page("VouchNet", body)
 
 
-@app.get("/profile/{name}", response_class=HTMLResponse)
+@app.api_route("/profile/{name}", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def agent_profile(name: str) -> str:
     """Human detail page for one agent: pentagon, scores, and every review.
 
@@ -431,7 +436,7 @@ def add_review(review: Review) -> dict:
     return {"ok": True, "message": f"Review of '{review.agent}' recorded."}
 
 
-@app.get("/agents/{name}")
+@app.api_route("/agents/{name}", methods=["GET", "HEAD"])
 def get_agent(name: str) -> dict:
     """Look up one agent's reputation: averages, dimension profile, and reviews."""
     reviews = _load_for(name)
@@ -447,7 +452,7 @@ def get_agent(name: str) -> dict:
     }
 
 
-@app.get("/leaderboard")
+@app.api_route("/leaderboard", methods=["GET", "HEAD"])
 def leaderboard() -> dict:
     """Rank all reviewed agents from best to worst average rating."""
     stars_by_agent: dict[str, list[int]] = {}
