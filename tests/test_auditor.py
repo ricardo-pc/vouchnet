@@ -23,16 +23,26 @@ def _probe(*calls: Call) -> Probe:
     return Probe(base_url="https://example.com", calls=list(calls))
 
 
-def _call(status=200, latency=100.0, documented=True, timed=True, expected=200) -> Call:
+def _call(
+    status=200,
+    latency=100.0,
+    documented=True,
+    timed=True,
+    expected=200,
+    phase="measure",
+    path="/x",
+    method="GET",
+) -> Call:
     return Call(
-        method="GET",
-        path="/x",
+        method=method,
+        path=path,
         status=status,
         latency_ms=latency,
         ok=status is not None and status < 400,
         timed=timed,
         documented=documented,
         expected_status=expected,
+        phase=phase,
     )
 
 
@@ -87,21 +97,27 @@ def test_reliability_ignores_undocumented_probes():
         _call(status=404, documented=False),  # guessed /api
         _call(status=404, documented=False),  # guessed /docs
     )
-    score, evidence = score_reliability(probe)
-    assert score == 5
-    assert "3/3" in evidence
+    _, evidence = score_reliability(probe)
+    assert "3/3" in evidence  # the guesses are not in the denominator
 
 
 def test_reliability_counts_documented_failures():
-    """A documented endpoint that 500s is exactly what this should catch."""
-    probe = _probe(
-        _call(status=200, documented=True),
-        _call(status=500, documented=True),
-        _call(status=500, documented=True),
-        _call(status=200, documented=True),
-    )
-    score, _ = score_reliability(probe)
-    assert score == 2  # 50% behaved as documented
+    """A documented endpoint that 500s is exactly what this should catch.
+
+    Asserts the ordering rather than an exact score: the number depends on the
+    prior, and a test that pins it breaks every time the model is tuned without
+    ever catching a real defect.
+    """
+    half_broken = score_reliability(_probe(*([_call()] * 5 + [_call(status=500)] * 5)))
+    clean = score_reliability(_probe(*([_call()] * 10)))
+    assert half_broken[0] < clean[0]
+    assert half_broken[0] <= 3
+
+
+def test_total_failure_scores_the_floor():
+    """Every documented endpoint broken is a 1, not a charitable 2."""
+    score, _ = score_reliability(_probe(*[_call(status=500) for _ in range(9)]))
+    assert score == 1
 
 
 def test_a_documented_error_is_correct_behaviour_not_a_failure():
@@ -118,49 +134,30 @@ def test_a_documented_error_is_correct_behaviour_not_a_failure():
         _call(status=401, expected=401, documented=True),  # unauthenticated read
         _call(status=404, expected=404, documented=True),  # nonexistent record
     )
-    score, evidence = score_reliability(probe)
-    assert score == 5
-    assert "4/4" in evidence
+    _, evidence = score_reliability(probe)
+    assert "4/4" in evidence  # correct refusals are not failures
 
 
 def test_any_2xx_satisfies_an_expected_success():
     """201 Created is more correct than 200 OK for a create, and AgentPress
     returns it. Exact-matching scored that as a reliability failure -- punishing
     a service for better REST than the auditor's default guess."""
-    probe = _probe(
-        _call(status=201, expected=200, documented=True),  # create
-        _call(status=204, expected=200, documented=True),  # no content
-        _call(status=200, expected=200, documented=True),
-    )
-    score, evidence = score_reliability(probe)
-    assert score == 5
-    assert "3/3" in evidence
+    assert _call(status=201, expected=200).met_contract  # create
+    assert _call(status=204, expected=200).met_contract  # no content
+    assert _call(status=200, expected=200).met_contract
 
 
 def test_expected_error_still_requires_an_exact_match():
     """Leniency inside 2xx must not leak into the error codes: 401 and 403 mean
     different things and a service that swaps them broke its contract."""
-    probe = _probe(
-        _call(status=403, expected=401, documented=True),
-        _call(status=200, expected=200, documented=True),
-        _call(status=200, expected=200, documented=True),
-        _call(status=200, expected=200, documented=True),
-    )
-    score, _ = score_reliability(probe)
-    assert score == 3  # 3/4
+    assert not _call(status=403, expected=401).met_contract
+    assert _call(status=401, expected=401).met_contract
 
 
 def test_wrong_status_is_a_failure_even_when_successful():
-    """The inverse: 200 where the docs promise 401 is a broken contract --
-    and a security hole. It must not score as a pass just for being 2xx."""
-    probe = _probe(
-        _call(status=200, expected=401, documented=True),
-        _call(status=200, expected=200, documented=True),
-        _call(status=200, expected=200, documented=True),
-        _call(status=200, expected=200, documented=True),
-    )
-    score, _ = score_reliability(probe)
-    assert score == 3  # 3/4 kept the contract
+    """The inverse: 200 where the docs promise 401 is a broken contract -- and a
+    security hole. It must not pass just for being 2xx."""
+    assert not _call(status=200, expected=401).met_contract
 
 
 def test_reliability_unrated_without_enough_documented_calls():
@@ -174,6 +171,111 @@ def test_reliability_unrated_when_nothing_was_documented():
     statement about its docs (see clarity), not about its uptime."""
     probe = _probe(*[_call(documented=False) for _ in range(5)])
     assert score_reliability(probe) is None
+
+
+# ------------------------------------------------ discovery vs measurement
+
+
+def test_only_measured_calls_are_scored():
+    """The agent's exploration must not reach the score. Its discovery calls
+    can fail all day (it is guessing); only the harness's fixed replay counts."""
+    probe = _probe(
+        *[_call(status=500, phase="discover") for _ in range(5)],
+        *[_call(status=200, phase="measure") for _ in range(6)],
+    )
+    _, evidence = score_reliability(probe)
+    assert "6/6" in evidence  # the agent's five failed guesses are not scored
+
+
+def test_scoring_is_deterministic_given_the_same_plan():
+    """The bug this fixes: AgentHall scored 3 then 5 on identical code, because
+    one run explored 9 endpoints and the next explored 7. Same plan in, same
+    number out."""
+    plan = [_call(status=200) for _ in range(9)] + [_call(status=500)]
+    assert score_reliability(_probe(*plan)) == score_reliability(_probe(*plan))
+
+
+def test_measure_replays_reads_a_fixed_number_of_times(monkeypatch):
+    from vouchnet import auditor
+
+    session = ProbeSession("https://example.com")
+    seen: list[tuple[str, str, str]] = []
+
+    def fake_request(method, path, body=None, documented=False, expected_status=200, phase="discover"):
+        seen.append((method, path, phase))
+        return {"status": expected_status}
+
+    monkeypatch.setattr(session, "request", fake_request)
+    # The agent poked /a twice and /b once while exploring; /c was a guess.
+    session.probe.calls.extend([
+        _call(path="/a", phase="discover"),
+        _call(path="/a", phase="discover"),
+        _call(path="/b", phase="discover"),
+        _call(path="/c", phase="discover", documented=False),
+    ])
+    auditor.measure(session)
+
+    # Each distinct documented read, exactly k times. The undocumented guess is
+    # not replayed -- it was never the service's promise.
+    assert sorted(seen) == sorted(
+        [("GET", "/a", "measure")] * auditor.MEASUREMENT_REPEATS
+        + [("GET", "/b", "measure")] * auditor.MEASUREMENT_REPEATS
+    )
+
+
+def test_measure_never_replays_writes():
+    """Replaying a POST would manufacture state on someone else's service three
+    times over -- the measurement would create the thing it claims to observe."""
+    from vouchnet import auditor
+
+    session = ProbeSession("https://example.com")
+    sent: list[str] = []
+    session.request = lambda *a, **k: sent.append(a[0]) or {"status": 200}  # type: ignore
+    session.probe.calls.append(_call(method="POST", path="/reviews", phase="discover"))
+    auditor.measure(session)
+    assert sent == []
+
+
+# ------------------------------------------------------ bayesian shrinkage
+
+
+def test_a_tiny_perfect_sample_cannot_buy_a_five():
+    """Three lucky calls are not a track record. Shrinkage keeps a thin sample
+    near the prior instead of at an extreme."""
+    thin = score_reliability(_probe(*[_call(status=200) for _ in range(3)]))
+    thick = score_reliability(_probe(*[_call(status=200) for _ in range(30)]))
+    assert thin[0] < thick[0]
+    assert thick[0] == 5
+
+
+def test_shrinkage_removes_the_threshold_cliff():
+    """8/9 (89%) scored 3 while 9/10 (90%) scored 4 -- near-identical
+    reliability, a whole point apart, because of an arbitrary cutoff."""
+    a = score_reliability(_probe(*([_call()] * 8 + [_call(status=500)])))
+    b = score_reliability(_probe(*([_call()] * 9 + [_call(status=500)])))
+    assert abs(a[0] - b[0]) <= 1
+
+
+def test_evidence_reports_the_interval():
+    """A single number hides how much evidence is behind it."""
+    _, evidence = score_reliability(_probe(*[_call() for _ in range(9)]))
+    assert "posterior" in evidence and "lower bound" in evidence and "CI" in evidence
+
+
+def test_one_miss_in_nine_is_not_distinguishable_from_perfect():
+    """Not a bug -- the honest consequence of a 1-5 scale at n=9. The lower
+    bound says you cannot tell 8/9 from 9/9 at that sample size, so the score
+    does not pretend to. Resolution comes from more calls, not sharper rounding.
+    """
+    assert (
+        score_reliability(_probe(*([_call()] * 8 + [_call(status=500)])))[0]
+        == score_reliability(_probe(*([_call()] * 9)))[0]
+    )
+    # With a real sample, the same one-in-nine failure rate is visible.
+    assert (
+        score_reliability(_probe(*([_call()] * 24 + [_call(status=500)] * 3)))[0]
+        < score_reliability(_probe(*([_call()] * 27)))[0]
+    )
 
 
 # -------------------------------------------------------------- guardrails

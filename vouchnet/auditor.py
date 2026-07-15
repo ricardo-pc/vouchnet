@@ -48,7 +48,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
-from . import env
+from . import env, trust
 
 MODEL = "claude-opus-4-8"
 
@@ -84,6 +84,10 @@ class Call:
     # What the docs say this exact request should return. A 401 on a call made
     # deliberately without credentials is the service working, not failing.
     expected_status: int = 200
+    # "discover" = the agent poking around, deciding what exists. "measure" =
+    # the harness re-calling that plan a fixed number of times. Only measure
+    # calls are scored -- see `measure()`.
+    phase: str = "discover"
 
     @property
     def met_contract(self) -> bool:
@@ -122,6 +126,11 @@ class Probe:
     def contractual(self) -> list[Call]:
         """Calls to endpoints the service documented -- its actual promises."""
         return [call for call in self.timed if call.documented]
+
+    @property
+    def measured(self) -> list[Call]:
+        """The harness's fixed-repeat calls -- the only ones that get scored."""
+        return [call for call in self.contractual if call.phase == "measure"]
 
     @property
     def mutations(self) -> list[Call]:
@@ -177,9 +186,12 @@ class ProbeSession:
         body: dict | None = None,
         documented: bool = False,
         expected_status: int = 200,
+        phase: str = "discover",
     ) -> dict:
         """One guarded request. Returns a result dict for the model to read."""
-        if len(self.probe.calls) >= self.max_calls:
+        # The budget bounds what the *agent* does. The measurement phase that
+        # follows is fixed and code-driven, so it gets its own allowance.
+        if phase == "discover" and len(self.probe.timed) >= self.max_calls:
             return {"error": f"call budget exhausted ({self.max_calls}); file your review now"}
 
         method = method.upper()
@@ -215,6 +227,7 @@ class ProbeSession:
                 ok=response.status_code < 400,
                 documented=documented,
                 expected_status=expected_status,
+                phase=phase,
             )
             self.probe.calls.append(call)
             text = response.text[:MAX_BODY_CHARS]
@@ -238,6 +251,7 @@ class ProbeSession:
                     error=type(exc).__name__,
                     documented=documented,
                     expected_status=expected_status,
+                    phase=phase,
                 )
             )
             return {
@@ -247,19 +261,71 @@ class ProbeSession:
 
 
 # --------------------------------------------------------------------------
+# The measurement phase: same plan, same repeats, every time.
+# --------------------------------------------------------------------------
+
+MEASUREMENT_REPEATS = 3
+
+
+def measure(session: ProbeSession, verbose: bool = False) -> None:
+    """Re-call every documented read the agent found, a fixed number of times.
+
+    This exists because the agent's *exploration* was leaking into the score.
+    Auditing AgentHall twice gave reliability 3 and then 5 -- not because
+    anything changed, but because one run happened to try 9 endpoints and the
+    next tried 7. The denominator was the agent's mood.
+
+    So the two jobs are split. Deciding what exists and what it should return is
+    judgement, and the agent does it. Counting how often the service delivers is
+    measurement, and the harness does it: the same endpoints, the same number of
+    repeats, whatever the agent felt like poking. Given the same plan, the same
+    numbers come out.
+
+    Only idempotent reads are repeated. Replaying a POST would manufacture state
+    on someone else's service three times over -- the measurement would create
+    the thing it claims to be observing.
+    """
+    plan = sorted(
+        {
+            (call.method, call.path, call.expected_status)
+            for call in session.probe.contractual
+            if call.method in ("GET", "HEAD")
+        }
+    )
+    if verbose and plan:
+        print(
+            f"  measuring {len(plan)} documented reads x{MEASUREMENT_REPEATS}…",
+            file=sys.stderr,
+        )
+    for method, path, expected in plan:
+        for _ in range(MEASUREMENT_REPEATS):
+            session.request(
+                method, path, documented=True, expected_status=expected, phase="measure"
+            )
+
+
+# --------------------------------------------------------------------------
 # Measured dimensions: computed, not judged.
 # --------------------------------------------------------------------------
 
 # Latency thresholds in ms, best-first. Median rather than mean: one cold
 # outlier should not define a service's speed.
 _SPEED_RUBRIC = ((300, 5), (800, 4), (2000, 3), (5000, 2))
-_RELIABILITY_RUBRIC = ((1.0, 5), (0.9, 4), (0.75, 3), (0.5, 2))
 MIN_CALLS_FOR_RELIABILITY = 3
+
+# The prior for reliability: assume a service is decent (0.75, i.e. 4 stars)
+# until shown otherwise, with the weight of ~2 observations. Weak enough that
+# real evidence dominates quickly, strong enough that three lucky calls cannot
+# buy a perfect score.
+RELIABILITY_PRIOR = trust.Prior(mean_p=0.75, strength=2.0)
 
 
 def score_speed(probe: Probe) -> tuple[int, str] | None:
     """Score speed from measured latency. None when nothing succeeded."""
-    latencies = probe.latencies()
+    pool = probe.measured or probe.timed
+    latencies = [
+        call.latency_ms for call in pool if call.ok and call.latency_ms is not None
+    ]
     if not latencies:
         return None
     median = statistics.median(latencies)
@@ -291,17 +357,33 @@ def score_reliability(probe: Probe) -> tuple[int, str] | None:
 
     Returns None when too few documented endpoints were exercised -- a statement
     about the docs (see `clarity`), not about reliability.
+
+    Scored from the lower edge of a Beta posterior rather than a raw success
+    rate -- the same question the leaderboard asks: what can this service
+    *defend*? A rate over a handful of calls is mostly noise, and thresholding
+    it produced absurd cliffs (8/9 = 89% scored 3, while 9/10 = 90% scored 4,
+    for near-identical reliability).
+
+    The lower bound makes uncertainty cost something, so a perfect record has to
+    be earned: 3/3 tops out at 4, and a 5 needs roughly 15 clean calls. It also
+    fixes the tail the posterior mean gets wrong -- a service that fails every
+    documented endpoint scores 1 here, where the mean would charitably say 2.
     """
-    contractual = probe.contractual
-    if len(contractual) < MIN_CALLS_FOR_RELIABILITY:
+    scored = probe.measured or probe.contractual
+    if len(scored) < MIN_CALLS_FOR_RELIABILITY:
         # Two calls cannot distinguish "reliable" from "lucky".
         return None
-    kept = [call for call in contractual if call.met_contract]
-    rate = len(kept) / len(contractual)
-    score = next((points for limit, points in _RELIABILITY_RUBRIC if rate >= limit), 1)
+    kept = [call for call in scored if call.met_contract]
+
+    # Each call is one Bernoulli observation: did the service keep its contract?
+    observations = [(1.0, 1.0)] * len(kept) + [(0.0, 1.0)] * (len(scored) - len(kept))
+    post = trust.posterior(observations, RELIABILITY_PRIOR)
+    low, high = post.interval_stars(0.9)
+    score = int(max(1, min(5, round(low))))
     return score, (
-        f"{len(kept)}/{len(contractual)} documented endpoints behaved as "
-        f"documented ({rate:.0%})"
+        f"{len(kept)}/{len(scored)} calls kept the documented contract "
+        f"({len(kept) / len(scored):.0%}); posterior {post.mean_stars:.2f}★, "
+        f"scored on the 90% lower bound {low:.2f} (CI {low:.2f}-{high:.2f})"
     )
 
 
@@ -494,6 +576,9 @@ def audit(
         )
         for _ in runner:
             pass
+        # The agent has decided what exists; now measure it the same way every
+        # time, so the score reflects the service and not the exploration.
+        measure(session, verbose=verbose)
     finally:
         session.close()
 
