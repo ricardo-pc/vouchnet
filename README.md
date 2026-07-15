@@ -94,13 +94,50 @@ vouchnet/
   detect.py     Tarjan SCC, ring + brigade detection
   simulate.py   deterministic synthetic ecosystem with planted fraud
   evaluate.py   the eval harness that produced the tables above
+  auditor.py    an agent that reads a service's SKILL.md, calls it, reviews it
   store.py      Supabase, with an in-memory fallback
+  env.py        per-project .env loading
 main.py         FastAPI: the agent API + the graph/sandbox endpoints
 static/         the trust-graph UI — hand-rolled force layout on canvas
-tests/          81 tests, no network required
+tests/          114 tests, no network required
 ```
 
-**No numpy, no scipy, no node toolchain.** The incomplete beta function, the
+## Where the reviews come from
+
+The Auditor is an agent that finds a service's SKILL.md, reads it, calls its
+real endpoints, and files a review under a stable identity. The reviews on the
+live ledger came from it, against real third-party services.
+
+It follows the same rule as the rest of the project: **measure what can be
+measured, judge only what needs judgement.** The agent decides what exists and
+what each endpoint should return — judgement. The harness then replays that
+plan a fixed number of times and computes the score — measurement. That split
+is not decoration: before it, auditing the same service twice gave reliability
+3 and then 5, because one run happened to try nine endpoints and the next tried
+seven. The denominator was the agent's mood.
+
+It may only score what it observed. It cannot verify correctness from outside,
+so `accuracy` stays *unrated* rather than guessed — the same "unrated is not
+zero" rule the pentagon rests on, enforced where data enters instead of patched
+later. Guardrails are in code, not the prompt: host lock (a prompt-injected
+SKILL.md must not redirect it), call cap, timeouts, safe methods, and
+`--read-only` for targets whose stored state is a public record. An instruction
+can be argued with; a call cap cannot.
+
+```bash
+python -m vouchnet.auditor --target https://example.com --name example-agent
+python -m vouchnet.auditor --target https://example.com --name example-agent --publish
+```
+
+Dry-run by default. Every fairness bug in its rubric was found by pointing it at
+real services, and all of them were the same bug: a number that looked like a
+measurement was scoring the auditor's own behaviour. It docked a service 2/5 for
+404s on paths *it* invented; it docked another for returning a correct,
+documented 401; it docked a third for using 201 Created instead of 200.
+
+## No numpy, no scipy, no node toolchain
+
+The incomplete beta function, the
 power iteration, Tarjan's algorithm, and the force-directed layout are all
 written out longhand. At this scale (~60 nodes, ~300 reviews) the dependencies
 would cost more in cold-start latency on a free-tier container than they save in
