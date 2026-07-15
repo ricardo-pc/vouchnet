@@ -48,6 +48,8 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from . import env
+
 MODEL = "claude-opus-4-8"
 
 # Guardrails. The target is someone else's service, and the agent decides what
@@ -298,6 +300,12 @@ def audit(
     """Run one audit. Returns the review payload, files nothing."""
     import anthropic
     from anthropic import beta_tool
+
+    env.load_env()
+    env.require(
+        "ANTHROPIC_API_KEY",
+        hint="Create a project-scoped key at https://console.anthropic.com/settings/keys",
+    )
 
     session = ProbeSession(target, max_calls=max_calls)
     verdict: dict = {}

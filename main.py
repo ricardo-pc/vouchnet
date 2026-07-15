@@ -33,7 +33,11 @@ from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-from vouchnet import detect, simulate, store, trust
+from vouchnet import detect, env, simulate, store, trust
+
+# Before build_store() reads the environment: a local .env supplies credentials
+# in development, and is a no-op wherever real env vars are already set.
+env.load_env()
 
 _STATIC = Path(__file__).parent / "static"
 
