@@ -62,22 +62,34 @@ def test_speed_is_unrated_when_nothing_succeeded():
     assert score_speed(_probe()) is None
 
 
+def test_speed_needs_a_sample_not_an_anecdote():
+    """Dead Drop has no docs; exactly one guessed endpoint answered, and speed
+    scored 5/5 on a median of one call -- while reliability beside it demanded
+    ~15 clean calls for the same 5. One request cannot separate a fast service
+    from a lucky round-trip."""
+    assert score_speed(_probe(_call(latency=60))) is None
+    assert score_speed(_probe(*[_call(latency=60) for _ in range(3)]))[0] == 5
+
+
 @pytest.mark.parametrize(
     "latency, expected",
     [(100, 5), (500, 4), (1500, 3), (3000, 2), (9000, 1)],
 )
 def test_speed_rubric_is_monotone(latency, expected):
-    score, _ = score_speed(_probe(_call(latency=latency)))
+    score, _ = score_speed(_probe(*[_call(latency=latency) for _ in range(3)]))
     assert score == expected
 
 
 def test_warmup_calls_never_count():
     """Free-tier cold starts take 30-60s. Timing them would score every
     free-tier service 1/5 and call it measurement."""
-    probe = _probe(_call(latency=45000, timed=False), _call(latency=80))
+    probe = _probe(
+        _call(latency=45000, timed=False),  # the cold start, thrown away
+        *[_call(latency=80) for _ in range(3)],
+    )
     score, evidence = score_speed(probe)
     assert score == 5
-    assert "1 successful" in evidence
+    assert "3 successful" in evidence
 
 
 # ------------------------------------------------------------- reliability

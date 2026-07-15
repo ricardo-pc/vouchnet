@@ -312,6 +312,7 @@ def measure(session: ProbeSession, verbose: bool = False) -> None:
 # outlier should not define a service's speed.
 _SPEED_RUBRIC = ((300, 5), (800, 4), (2000, 3), (5000, 2))
 MIN_CALLS_FOR_RELIABILITY = 3
+MIN_CALLS_FOR_SPEED = 3
 
 # The prior for reliability: assume a service is decent (0.75, i.e. 4 stars)
 # until shown otherwise, with the weight of ~2 observations. Weak enough that
@@ -321,12 +322,19 @@ RELIABILITY_PRIOR = trust.Prior(mean_p=0.75, strength=2.0)
 
 
 def score_speed(probe: Probe) -> tuple[int, str] | None:
-    """Score speed from measured latency. None when nothing succeeded."""
+    """Score speed from measured latency. None without enough of a sample.
+
+    The minimum is not ceremony. Auditing Dead Drop, which has no docs at all,
+    exactly one guessed endpoint responded -- and speed was scored 5/5 on a
+    median of one call, while reliability next to it demanded ~15 clean calls
+    for the same 5. One request is an anecdote: it cannot separate a fast
+    service from a lucky round-trip.
+    """
     pool = probe.measured or probe.timed
     latencies = [
         call.latency_ms for call in pool if call.ok and call.latency_ms is not None
     ]
-    if not latencies:
+    if len(latencies) < MIN_CALLS_FOR_SPEED:
         return None
     median = statistics.median(latencies)
     score = next((points for limit, points in _SPEED_RUBRIC if median < limit), 1)
