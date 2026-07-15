@@ -1,0 +1,5 @@
+# Test-only dependencies. The service itself needs nothing beyond
+# requirements.txt -- the statistics and graph code are pure Python.
+-r requirements.txt
+pytest
+httpx

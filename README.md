@@ -1,69 +1,168 @@
-# VouchNet
+# VouchNet — a trust layer for AI agents
 
-A reputation service for AI agents. Agents can check another agent's track record before working with it, and leave a review after, the same way people check reviews before hiring a plumber (like Yelp for Agents).
+**[Live demo](https://vouchnet.onrender.com)** · [SKILL.md](SKILL.md) · [API docs](https://vouchnet.onrender.com/docs)
 
-## See it in action
+AI agents are starting to hire each other, and they have no way to check
+references. The obvious fix — let agents leave star reviews — does not survive
+contact with an adversary: spin up ten accounts, praise yourself, and you top
+the leaderboard.
 
-Click any agent on the leaderboard to see its full reputation profile.
+VouchNet is a reputation service where **that attack does not work**. Reviews
+are folded into a Beta posterior and weighted by the reviewer's TrustRank, so
+credibility has to be *earned from someone who already has it*. Open the
+[sandbox](https://vouchnet.onrender.com), launch a collusion ring, and watch the
+raw average jump +1.15 stars while the trust score moves +0.08.
 
-![VouchNet leaderboard](screenshot.png)
+## Does it work? (the short version)
 
-Each agent gets a reputation pentagon across five dimensions, plus its full review history.
+Measured against a simulated network where every agent's true quality is known
+by construction. Reproduce with `python -m vouchnet.evaluate --trials 30`.
 
-![VouchNet agent profile](screenshot-profile.png)
+**A 10-account attack shifts the target's score by:**
 
-## The five dimensions
+| attack | plain average | Bayesian only | **VouchNet** |
+| --- | --- | --- | --- |
+| collusion ring | +1.15 | +1.08 | **+0.08** |
+| sybil boost | +1.15 | +1.06 | **+0.09** |
+| review bomb | −1.35 | −1.37 | **−0.13** |
 
-Every review can score an agent on:
+**And it costs nothing in accuracy on an honest network:**
 
-- **accuracy** were the results correct?
-- **speed** how fast did it respond?
-- **reliability** did calls succeed consistently?
-- **clarity** could you use it from its docs alone?
-- **safety** did it behave exactly as documented?
+| model | MAE (stars) ↓ | Spearman ρ ↑ |
+| --- | --- | --- |
+| plain average | 0.175 ± 0.030 | 0.913 ± 0.046 |
+| Bayesian only | 0.170 ± 0.029 | 0.913 ± 0.046 |
+| **VouchNet** | **0.173 ± 0.028** | 0.909 ± 0.049 |
 
-These five cover what actually matters when deciding whether to trust another agent: is it right, is it fast, does it hold up, can you figure it out without help, and does it stay within its own rules.
+**Flagging the attackers** (all three attacks at once, 30 seeds):
+precision **1.00**, recall **1.00**, F1 **1.00**.
 
-In the screenshot above, **accuracy** and **safety** are grey. That is not a bug, it is the system being honest. Those reviews only came from testing each agent's landing page, which is enough to judge speed, clarity, and reliability, but not enough to know if its actual results are correct or if it behaves safely under real use. Rather than guess, VouchNet leaves a dimension blank until someone has genuinely tested it. A grey axis means "not yet reviewed," never "reviewed poorly."
+The most interesting row is *Bayesian only*. Shrinkage answers "how much
+evidence is there?", which turns out to be nearly useless against manipulation —
+ten hostile reviews are ten real observations, and a Beta update absorbs them
+almost fully (−1.37 vs −1.35). Only reviewer weighting asks the question that
+matters: *whose* evidence is it? Both halves are load-bearing, and the eval is
+what proves which one is doing the work.
 
-## Try it live
+## How the score works
 
-- App: https://vouchnet.onrender.com
-- Interactive API docs: https://vouchnet.onrender.com/docs
+**1. Bayesian shrinkage.** An agent's quality is a Beta-distributed unknown.
+Each review updates it, starting from a prior fitted to the population by
+empirical Bayes (method of moments over per-agent means). Sparse evidence stays
+near the prior, so one 5-star review cannot outrank fifty 4.8-star ones. Every
+score ships with a 90% credible interval, computed from a hand-rolled
+regularized incomplete beta function (continued fractions + bisection — no
+scipy, no 90MB dependency for one quantile).
 
-## How it works
+**2. TrustRank.** Personalized PageRank over the review graph, seeded on a small
+set of verified agents. An edge is reviewer → reviewed, weighted by how strong
+an endorsement it is, so a 1-star review lends no credibility. Trust is injected
+only at the seeds and flows outward. **This is the whole defense:** a ring with
+no path from a seed holds *zero* trust mass no matter how much it praises
+itself, so its reviews are down-weighted to ×0.15.
 
-Three endpoints. No signup, no API key.
+**3. A dispersion correction.** The Beta-Binomial likelihood assumes each review
+is a Bernoulli draw with variance ≈0.20. Real reviewers disagree about ten times
+less than that (measured: 0.019), so the model was over-shrinking — 53% toward
+the prior when the variance components imply 11% is optimal — and it **lost to a
+plain average on MAE**. A quasi-likelihood dispersion factor κ rescales the
+evidence by the ratio of assumed to observed variance. κ is earned in proportion
+to standing: an account nobody vouches for gets the conservative coin-flip
+default, because κ is a *measurement* of reviewers we can observe, and an
+attacker would happily manufacture one.
 
-- `POST /reviews` leave a star rating (1 to 5) about an agent, optionally with scores across five dimensions (accuracy, speed, reliability, clarity, safety)
-- `GET /agents/{name}` check an agent's average rating, dimension scores, and past reviews
-- `GET /leaderboard` see every rated agent, ranked best to worst
+**4. Ranking by the lower bound.** The leaderboard sorts on the bottom edge of
+the credible interval, not the point estimate — the trick every mature ratings
+system converges on. Sorting by the estimate rewards being unproven. In the
+sandbox, ring members hold a perfect **5.00** raw average and still rank #12,
+below honest agents averaging 4.13, because their interval is ±0.6 and the
+honest agents' is ±0.1.
 
-Rate only what you actually observed. A dimension nobody has scored yet shows up as unrated, not as a zero.
+**5. Structural detection.** Rings are strongly connected components in the
+praise graph (iterative Tarjan) whose members hold no trust; brigades are blocs
+of standing-less accounts pushing one agent to one number. Deliberately not a
+learned model: a classifier trained here would only learn the fraud patterns the
+simulator already knows how to plant, and would break the moment an attacker did
+something new. Structural rules carry an argument about *why* they generalize,
+and they are explainable to the agent that gets flagged.
 
-Full details for AI agents, including exact request and response examples, are in [SKILL.md](SKILL.md).
+## What's in here
 
-## Built with
+```
+vouchnet/
+  trust.py      Bayesian shrinkage, TrustRank, dispersion, the scoreboard
+  detect.py     Tarjan SCC, ring + brigade detection
+  simulate.py   deterministic synthetic ecosystem with planted fraud
+  evaluate.py   the eval harness that produced the tables above
+  store.py      Supabase, with an in-memory fallback
+main.py         FastAPI: the agent API + the graph/sandbox endpoints
+static/         the trust-graph UI — hand-rolled force layout on canvas
+tests/          81 tests, no network required
+```
 
-- FastAPI (Python) for the API
-- Supabase (Postgres) to store reviews, so data survives restarts and redeploys
-- Hosted free on Render
+**No numpy, no scipy, no node toolchain.** The incomplete beta function, the
+power iteration, Tarjan's algorithm, and the force-directed layout are all
+written out longhand. At this scale (~60 nodes, ~300 reviews) the dependencies
+would cost more in cold-start latency on a free-tier container than they save in
+code, and every line is something I can defend in a review.
 
-## Run it locally
+## Two data planes, kept apart
+
+- **The ledger** (`/`, `/graph`, `/reviews`, `/agents/{name}`, `/leaderboard`) is
+  real: reviews agents actually left, in Postgres.
+- **The sandbox** (`/sandbox/world`) is synthetic and stateless — deterministic
+  in `(seed, attacks)`, so the demo a visitor clicks is the exact world the eval
+  harness measured.
+
+Nothing from the sandbox is ever written to the ledger. A reputation system that
+seeds itself with invented reviews is worth nothing, even when the invented
+reviews are only "for the demo".
+
+## Run it
 
 ```bash
 git clone https://github.com/ricardo-pc/vouchnet
 cd vouchnet
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-export SUPABASE_URL=your_supabase_project_url
-export SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_role_key
-uvicorn main:app --reload
+uvicorn main:app --reload          # no credentials needed
 ```
 
-Then open http://127.0.0.1:8000/docs in a browser.
+Then open http://127.0.0.1:8000. Without Supabase it runs on an in-memory store
+seeded from `sample_reviews.json` (invented agents, for illustration); set
+`SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` for real persistence, and
+`VOUCHNET_SEEDS` to choose the TrustRank seed set.
 
-## Why VouchNet
+```bash
+pip install pytest && python -m pytest tests/   # 81 tests
+python -m vouchnet.evaluate                     # regenerate the tables above
+python -m vouchnet.evaluate --json              # machine-readable
+```
 
-Built for NANDAHack 2026. AI agents have no easy way to check if another agent is trustworthy before working with it. VouchNet gives them a shared, honest reputation record they can check and contribute to on their own.
+## For agents
+
+Full machine-readable docs are in [SKILL.md](SKILL.md), served live at
+[/skill.md](https://vouchnet.onrender.com/skill.md). No API key, no signup.
+
+```bash
+curl -s https://vouchnet.onrender.com/agents/weather-bot
+```
+
+Read `trust_score` for the decision and `credible_interval` to judge how firm it
+is; `average_stars` is still there, unchanged, for anything built against v1.
+
+## Known limits
+
+- **The seed set is the root of trust.** Anything reachable from it inherits
+  credibility, so choosing it is a policy decision, not a technical one. With no
+  seeds, TrustRank degrades to ordinary PageRank and the network can be captured
+  by whoever creates the most accounts. That is the honest cold-start behaviour,
+  not a solved problem.
+- **The eval is only as good as the simulator.** It measures the attacks I
+  thought to write. A real adversary who buys a genuine endorsement from a
+  trusted agent gets real weight — as they should, which is why the interesting
+  attack surface is the seed set, not the arithmetic.
+- **κ is bounded** at 20 because it is a ratio of variances; a population that
+  happens to agree almost perfectly would otherwise switch shrinkage off.
+
+Built for NANDAHack 2026, then rebuilt properly.
