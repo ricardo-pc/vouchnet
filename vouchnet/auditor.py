@@ -81,6 +81,30 @@ class Call:
     # Whether the service's own docs said this endpoint exists. Only documented
     # calls can count against reliability -- see `score_reliability`.
     documented: bool = False
+    # What the docs say this exact request should return. A 401 on a call made
+    # deliberately without credentials is the service working, not failing.
+    expected_status: int = 200
+
+    @property
+    def met_contract(self) -> bool:
+        """Did the service do what its docs promised for this input?
+
+        This is the question reliability actually asks -- not `status < 400`.
+        A documented 404 for a missing resource and a documented 401 for an
+        unauthenticated read are both correct behaviour.
+
+        Within 2xx the exact code is a style choice, so any success satisfies an
+        expected success: AgentPress returns 201 Created from its register
+        endpoint, which is *more* correct than 200, and an exact match would
+        have scored it a reliability failure for it. Outside 2xx the exact code
+        is the contract -- 401 and 403 mean different things, and a 200 where
+        401 was promised is a security hole, not a rounding error.
+        """
+        if self.status is None:
+            return False
+        if 200 <= self.expected_status < 300:
+            return 200 <= self.status < 300
+        return self.status == self.expected_status
 
 
 @dataclass
@@ -134,6 +158,7 @@ class ProbeSession:
         path: str,
         body: dict | None = None,
         documented: bool = False,
+        expected_status: int = 200,
     ) -> dict:
         """One guarded request. Returns a result dict for the model to read."""
         if len(self.probe.calls) >= self.max_calls:
@@ -161,6 +186,7 @@ class ProbeSession:
                 latency_ms=round(latency, 1),
                 ok=response.status_code < 400,
                 documented=documented,
+                expected_status=expected_status,
             )
             self.probe.calls.append(call)
             text = response.text[:MAX_BODY_CHARS]
@@ -183,6 +209,7 @@ class ProbeSession:
                     ok=False,
                     error=type(exc).__name__,
                     documented=documented,
+                    expected_status=expected_status,
                 )
             )
             return {
@@ -216,29 +243,37 @@ def score_speed(probe: Probe) -> tuple[int, str] | None:
 
 
 def score_reliability(probe: Probe) -> tuple[int, str] | None:
-    """Score reliability over documented endpoints only.
+    """Did the service do what its docs promised, on the endpoints it promised?
 
-    Measured against the service's own promises, not against paths the auditor
-    guessed. The first version of this scored every call, and it was unfair in a
-    way that only showed up against real services: probing /api and /docs on a
-    site that documents neither produced two 404s and a 2/5 reliability score.
-    Those 404s are evidence about the auditor's guesses -- the service behaved
-    correctly by refusing a route it never advertised.
+    Two fairness bugs shaped this, and both only appeared against real services:
 
-    Returns None when the auditor never found enough documented endpoints to
-    exercise, which is a statement about the docs (and shows up in `clarity`),
-    not about reliability.
+    1. Scoring *every* call punished the service for the auditor's guesses --
+       probing /api and /docs on a site that documents neither produced two 404s
+       and a 2/5. So only documented endpoints count.
+    2. Scoring `status < 400` punished the service for *correct error handling*.
+       Auditing AgentPress, the agent deliberately tested an unauthenticated
+       read and a nonexistent record, got a documented 401 and a documented 404,
+       scored safety 5/5 because they were exactly right -- and the same two
+       calls dragged reliability to 3/5. A service that correctly refuses is
+       working. Reliability asks whether behaviour matched the contract, so a
+       401 that the docs promise counts as a success.
+
+    Both bugs shared a shape: a number that looked like a measurement was
+    actually scoring the auditor's own behaviour.
+
+    Returns None when too few documented endpoints were exercised -- a statement
+    about the docs (see `clarity`), not about reliability.
     """
     contractual = probe.contractual
     if len(contractual) < MIN_CALLS_FOR_RELIABILITY:
         # Two calls cannot distinguish "reliable" from "lucky".
         return None
-    succeeded = [call for call in contractual if call.ok]
-    rate = len(succeeded) / len(contractual)
+    kept = [call for call in contractual if call.met_contract]
+    rate = len(kept) / len(contractual)
     score = next((points for limit, points in _RELIABILITY_RUBRIC if rate >= limit), 1)
     return score, (
-        f"{len(succeeded)}/{len(contractual)} calls to documented endpoints "
-        f"succeeded ({rate:.0%})"
+        f"{len(kept)}/{len(contractual)} documented endpoints behaved as "
+        f"documented ({rate:.0%})"
     )
 
 
@@ -258,11 +293,20 @@ and the home page, with documented=False -- you are guessing at this stage.
 shape, send that shape and check whether the response matches what was promised.
 4. File exactly one review with the file_review tool, then stop.
 
-The documented flag is a fairness mechanism, and you are the only one who can \
-set it correctly, because you are the one who read the docs. A 404 on a path \
-you invented says nothing about the service -- it is your guess that was wrong, \
-and marking it documented=True would punish them for your exploration. Only set \
-documented=True for endpoints the service itself advertises.
+The documented and expected_status flags are fairness mechanisms, and you are \
+the only one who can set them correctly, because you are the one who read the \
+docs. Get them right:
+
+- A 404 on a path you invented says nothing about the service -- your guess was \
+wrong, not their uptime. Only set documented=True for endpoints they advertise.
+- Testing error paths is good auditing, so do it -- but set expected_status to \
+what SHOULD happen. Calling a protected endpoint without credentials and \
+getting 401 means the service worked: pass expected_status=401 and it counts as \
+a success. Passing 200 there would mark a correct refusal as a failure and \
+punish them for security you should be rewarding.
+
+Reliability measures whether the service did what it promised. It is not a \
+count of 2xx responses.
 
 Rules that are not negotiable:
 
@@ -312,7 +356,11 @@ def audit(
 
     @beta_tool
     def probe_endpoint(
-        method: str, path: str, body_json: str = "", documented: bool = False
+        method: str,
+        path: str,
+        body_json: str = "",
+        documented: bool = False,
+        expected_status: int = 200,
     ) -> str:
         """Call an endpoint on the service being audited and see what it returns.
 
@@ -322,9 +370,16 @@ def audit(
             body_json: JSON object as a string, for POST requests. Empty for GET.
             documented: True only if this exact endpoint is described in the
                 service's own documentation. False when you are guessing or
-                exploring. This decides whether a failure counts against the
+                exploring. This decides whether the call counts toward the
                 service's reliability score, so guessing wrong must never be
                 held against them -- be strict about it.
+            expected_status: The HTTP status the service's docs say THIS request
+                should return. 200 for a normal call, but 401 if you are
+                deliberately calling without credentials, or 404 if you are
+                deliberately requesting something that should not exist.
+                Reliability compares what happened against this, so testing an
+                error path never counts against the service when the error is
+                the documented, correct answer.
         """
         parsed = None
         if body_json.strip():
@@ -332,11 +387,14 @@ def audit(
                 parsed = json.loads(body_json)
             except json.JSONDecodeError as exc:
                 return json.dumps({"error": f"body_json is not valid JSON: {exc}"})
-        result = session.request(method, path, parsed, documented=documented)
+        result = session.request(
+            method, path, parsed, documented=documented, expected_status=expected_status
+        )
         if verbose:
             status = result.get("status", result.get("error", "?"))
             tag = "doc" if documented else "   "
-            print(f"    {tag} {method:4s} {path:38s} -> {status}", file=sys.stderr)
+            want = "" if status == expected_status else f" (wanted {expected_status})"
+            print(f"    {tag} {method:4s} {path:38s} -> {status}{want}", file=sys.stderr)
         return json.dumps(result)
 
     @beta_tool

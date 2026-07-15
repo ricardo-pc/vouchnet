@@ -23,7 +23,7 @@ def _probe(*calls: Call) -> Probe:
     return Probe(base_url="https://example.com", calls=list(calls))
 
 
-def _call(status=200, latency=100.0, documented=True, timed=True) -> Call:
+def _call(status=200, latency=100.0, documented=True, timed=True, expected=200) -> Call:
     return Call(
         method="GET",
         path="/x",
@@ -32,6 +32,7 @@ def _call(status=200, latency=100.0, documented=True, timed=True) -> Call:
         ok=status is not None and status < 400,
         timed=timed,
         documented=documented,
+        expected_status=expected,
     )
 
 
@@ -100,7 +101,66 @@ def test_reliability_counts_documented_failures():
         _call(status=200, documented=True),
     )
     score, _ = score_reliability(probe)
-    assert score == 2  # 50% success
+    assert score == 2  # 50% behaved as documented
+
+
+def test_a_documented_error_is_correct_behaviour_not_a_failure():
+    """The regression from the AgentPress audit.
+
+    The agent tested an unauthenticated read and a nonexistent record, got the
+    documented 401 and 404, and scored safety 5/5 because they were exactly
+    right -- while those same two calls dragged reliability to 3/5. A service
+    that correctly refuses is working.
+    """
+    probe = _probe(
+        _call(status=200, expected=200, documented=True),
+        _call(status=200, expected=200, documented=True),
+        _call(status=401, expected=401, documented=True),  # unauthenticated read
+        _call(status=404, expected=404, documented=True),  # nonexistent record
+    )
+    score, evidence = score_reliability(probe)
+    assert score == 5
+    assert "4/4" in evidence
+
+
+def test_any_2xx_satisfies_an_expected_success():
+    """201 Created is more correct than 200 OK for a create, and AgentPress
+    returns it. Exact-matching scored that as a reliability failure -- punishing
+    a service for better REST than the auditor's default guess."""
+    probe = _probe(
+        _call(status=201, expected=200, documented=True),  # create
+        _call(status=204, expected=200, documented=True),  # no content
+        _call(status=200, expected=200, documented=True),
+    )
+    score, evidence = score_reliability(probe)
+    assert score == 5
+    assert "3/3" in evidence
+
+
+def test_expected_error_still_requires_an_exact_match():
+    """Leniency inside 2xx must not leak into the error codes: 401 and 403 mean
+    different things and a service that swaps them broke its contract."""
+    probe = _probe(
+        _call(status=403, expected=401, documented=True),
+        _call(status=200, expected=200, documented=True),
+        _call(status=200, expected=200, documented=True),
+        _call(status=200, expected=200, documented=True),
+    )
+    score, _ = score_reliability(probe)
+    assert score == 3  # 3/4
+
+
+def test_wrong_status_is_a_failure_even_when_successful():
+    """The inverse: 200 where the docs promise 401 is a broken contract --
+    and a security hole. It must not score as a pass just for being 2xx."""
+    probe = _probe(
+        _call(status=200, expected=401, documented=True),
+        _call(status=200, expected=200, documented=True),
+        _call(status=200, expected=200, documented=True),
+        _call(status=200, expected=200, documented=True),
+    )
+    score, _ = score_reliability(probe)
+    assert score == 3  # 3/4 kept the contract
 
 
 def test_reliability_unrated_without_enough_documented_calls():
