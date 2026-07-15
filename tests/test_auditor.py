@@ -200,6 +200,40 @@ def test_probe_enforces_the_call_budget():
         session.close()
 
 
+def test_read_only_blocks_writes_in_the_harness_not_the_prompt():
+    """A review written to a reputation ledger is a public claim others read as
+    fact -- and one written by a seed identity mints real trust for whatever it
+    names. A prompt rule can be reasoned around; this cannot."""
+    session = ProbeSession("https://example.com", read_only=True)
+    try:
+        result = session.request("POST", "/reviews", {"agent": "x", "stars": 5})
+        assert "read-only audit" in result["error"]
+        assert session.probe.calls == []
+    finally:
+        session.close()
+
+
+def test_read_only_still_allows_reads():
+    session = ProbeSession("https://example.com", read_only=True)
+    try:
+        # Rejected for the host, not the method -- proving GET got past the gate.
+        result = session.request("GET", "https://elsewhere.example/x")
+        assert "refusing to leave" in result["error"]
+    finally:
+        session.close()
+
+
+def test_writes_are_recorded_as_mutations():
+    """Auditing a write API creates state on someone else's service. That should
+    never be a surprise, so it has to be visible."""
+    probe = _probe(
+        Call(method="GET", path="/a", status=200, latency_ms=5, ok=True),
+        Call(method="POST", path="/reviews", status=200, latency_ms=5, ok=True),
+        Call(method="POST", path="/reviews", status=422, latency_ms=5, ok=False),
+    )
+    assert [c.path for c in probe.mutations] == ["/reviews"]  # only the one that stuck
+
+
 @pytest.mark.parametrize("method", ["DELETE", "PUT", "PATCH"])
 def test_probe_permits_only_safe_methods(method):
     """The auditor reads and posts reviews. It has no business deleting

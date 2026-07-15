@@ -124,6 +124,11 @@ class Probe:
         return [call for call in self.timed if call.documented]
 
     @property
+    def mutations(self) -> list[Call]:
+        """Calls that left state behind on someone else's service."""
+        return [call for call in self.calls if call.method == "POST" and call.ok]
+
+    @property
     def successes(self) -> list[Call]:
         return [call for call in self.timed if call.ok]
 
@@ -134,10 +139,23 @@ class Probe:
 class ProbeSession:
     """Makes the calls, enforces the guardrails, records the evidence."""
 
-    def __init__(self, base_url: str, max_calls: int = MAX_CALLS) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        max_calls: int = MAX_CALLS,
+        read_only: bool = False,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.host = urlparse(self.base_url).netloc
         self.max_calls = max_calls
+        # Auditing a write API means creating state on someone else's service.
+        # Usually that is just using the thing as documented. It is not fine
+        # when the state IS the product: a review written to a reputation ledger
+        # is a permanent claim other agents read as fact, and one written by a
+        # seed identity mints real trust for whatever it names. Enforced here
+        # rather than in the prompt, because a rule the model can reason its way
+        # around is not a guarantee.
+        self.read_only = read_only
         self.probe = Probe(base_url=self.base_url)
         self._client = httpx.Client(timeout=TIMEOUT_SECONDS, follow_redirects=True)
 
@@ -167,6 +185,16 @@ class ProbeSession:
         method = method.upper()
         if method not in ("GET", "HEAD", "POST"):
             return {"error": f"method {method} is not permitted by the auditor harness"}
+        if self.read_only and method == "POST":
+            return {
+                "error": (
+                    "read-only audit: writes are blocked because this service's "
+                    "stored state is a public record other agents read as fact. "
+                    "Verify the documented write contract by reading instead "
+                    "(schemas, validation errors, existing records), and say in "
+                    "your comment that the write path was not exercised."
+                )
+            }
 
         url = urljoin(self.base_url + "/", path.lstrip("/"))
         # Host lock: the agent chooses the path, never the host. Without this a
@@ -308,6 +336,14 @@ punish them for security you should be rewarding.
 Reliability measures whether the service did what it promised. It is not a \
 count of 2xx responses.
 
+You are a guest on someone else's service. Prefer reading over writing: verify \
+a documented write by reading its schema, its validation errors, and the \
+records it already holds, before deciding you need to create one. When a write \
+is genuinely the only way to check a claim, make exactly one, use an obviously \
+disposable identity, and say in your comment what you left behind. If writes \
+are blocked, that is not a fault in the service -- note that the write path is \
+unverified and score only what you did check.
+
 Rules that are not negotiable:
 
 - ONLY score a dimension if you can point to something you actually observed \
@@ -340,6 +376,7 @@ def audit(
     name: str,
     max_calls: int = MAX_CALLS,
     verbose: bool = True,
+    read_only: bool = False,
 ) -> dict:
     """Run one audit. Returns the review payload, files nothing."""
     import anthropic
@@ -351,7 +388,7 @@ def audit(
         hint="Create a project-scoped key at https://console.anthropic.com/settings/keys",
     )
 
-    session = ProbeSession(target, max_calls=max_calls)
+    session = ProbeSession(target, max_calls=max_calls, read_only=read_only)
     verdict: dict = {}
 
     @beta_tool
@@ -492,6 +529,7 @@ def audit(
         "review": review,
         "evidence": evidence,
         "calls": [asdict(c) for c in session.probe.calls],
+        "mutations": [asdict(c) for c in session.probe.mutations],
     }
 
 
@@ -513,18 +551,62 @@ def main() -> None:
     )
     parser.add_argument("--max-calls", type=int, default=MAX_CALLS)
     parser.add_argument(
+        "--read-only",
+        action="store_true",
+        help=(
+            "Block writes. Use when the target's stored state is a public record "
+            "(a reputation ledger), where a probe row is a claim others read as fact."
+        ),
+    )
+    parser.add_argument(
         "--publish",
         action="store_true",
         help="Actually file the review. Without this, prints it and posts nothing.",
     )
     args = parser.parse_args()
 
-    result = audit(args.target, args.name, max_calls=args.max_calls)
+    result = audit(
+        args.target, args.name, max_calls=args.max_calls, read_only=args.read_only
+    )
 
     print(json.dumps(result["review"], indent=2))
     print("\nEvidence:", file=sys.stderr)
     for dimension, why in sorted(result["evidence"].items()):
         print(f"  {dimension:12s} {result['review']['dimensions'][dimension]}  {why}", file=sys.stderr)
+
+    # Show exactly which documented calls broke their contract. A reliability
+    # score docked for reasons nobody can see is not evidence, it is an
+    # accusation -- and this review is about to be public.
+    misses = [
+        call
+        for call in result["calls"]
+        if call["documented"]
+        and call["timed"]
+        and not (
+            200 <= call["expected_status"] < 300
+            and call["status"] is not None
+            and 200 <= call["status"] < 300
+        )
+        and call["status"] != call["expected_status"]
+    ]
+    if misses:
+        print("\nContract misses (what cost them reliability):", file=sys.stderr)
+        for call in misses:
+            got = call["status"] or call["error"]
+            print(
+                f"  {call['method']:4s} {call['path']:44s} got {got}, "
+                f"docs promised {call['expected_status']}",
+                file=sys.stderr,
+            )
+
+    # Auditing a write API creates state on someone else's service. That is
+    # often just using the thing as documented -- but it should never be a
+    # surprise, so say it out loud.
+    if result["mutations"]:
+        print("\nState left on the target (writes the audit made):", file=sys.stderr)
+        for call in result["mutations"]:
+            print(f"  {call['method']} {call['path']} -> {call['status']}", file=sys.stderr)
+        print("  Re-run with --read-only to verify without writing.", file=sys.stderr)
 
     if args.publish:
         print(f"\nPublishing to {args.vouchnet} …", file=sys.stderr)
